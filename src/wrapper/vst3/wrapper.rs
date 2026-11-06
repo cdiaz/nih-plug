@@ -24,7 +24,10 @@ use super::note_expressions::{self, NoteExpressionController};
 use super::util::{
     u16strlcpy, VstPtr, VST3_MIDI_CCS, VST3_MIDI_NUM_PARAMS, VST3_MIDI_PARAMS_START,
 };
-use super::util::{VST3_MIDI_CHANNELS, VST3_MIDI_PARAMS_END};
+use super::util::{
+    VST3_MIDI_CHANNELS, VST3_MIDI_PARAMS_END, VST3_NUM_PROGRAMS, VST3_PROGRAM_LIST_ID,
+    VST3_PROGRAM_PARAM_ID,
+};
 use super::view::WrapperView;
 use crate::prelude::{
     AuxiliaryBuffers, BufferConfig, MidiConfig, NoteEvent, ParamFlags, ProcessMode, ProcessStatus,
@@ -516,7 +519,7 @@ impl<P: Vst3Plugin> IEditController for Wrapper<P> {
     unsafe fn get_parameter_count(&self) -> i32 {
         // We need to add a whole bunch of parameters if the plugin accepts MIDI CCs
         if P::MIDI_INPUT >= MidiConfig::MidiCCs {
-            self.inner.param_hashes.len() as i32 + VST3_MIDI_NUM_PARAMS as i32
+            self.inner.param_hashes.len() as i32 + VST3_MIDI_NUM_PARAMS as i32 + 1
         } else {
             self.inner.param_hashes.len() as i32
         }
@@ -539,7 +542,16 @@ impl<P: Vst3Plugin> IEditController for Wrapper<P> {
         // If the parameter is a generated MIDI CC/channel pressure/pitch bend then it needs to be
         // handled separately
         let num_actual_params = self.inner.param_hashes.len() as i32;
-        if P::MIDI_INPUT >= MidiConfig::MidiCCs && param_index >= num_actual_params {
+        if P::MIDI_INPUT >= MidiConfig::MidiCCs
+            && param_index == num_actual_params + VST3_MIDI_NUM_PARAMS as i32
+        {
+            info.id = VST3_PROGRAM_PARAM_ID;
+            u16strlcpy(&mut info.title, "Program");
+            u16strlcpy(&mut info.short_title, "Program");
+            info.step_count = VST3_NUM_PROGRAMS as i32 - 1;
+            info.unit_id = kRootUnitId;
+            info.flags = ParameterFlags::kIsProgramChange as i32 | ParameterFlags::kIsList as i32;
+        } else if P::MIDI_INPUT >= MidiConfig::MidiCCs && param_index >= num_actual_params {
             let midi_param_relative_idx = (param_index - num_actual_params) as u32;
             // This goes up to 130 for the 128 CCs followed by channel pressure and pitch bend
             let midi_cc = midi_param_relative_idx % VST3_MIDI_CCS;
@@ -602,6 +614,12 @@ impl<P: Vst3Plugin> IEditController for Wrapper<P> {
 
         let dest = &mut *(string as *mut [TChar; 128]);
 
+        if P::MIDI_INPUT >= MidiConfig::MidiCCs && id == VST3_PROGRAM_PARAM_ID {
+            let program = program_index(value_normalized as f32);
+            u16strlcpy(dest, &format!("Program {}", program + 1));
+            return kResultOk;
+        }
+
         // TODO: We don't implement these methods at all for our generated MIDI CC parameters,
         //       should be fine right? They should be hidden anyways.
         match self.inner.param_by_hash.get(&id) {
@@ -645,6 +663,9 @@ impl<P: Vst3Plugin> IEditController for Wrapper<P> {
     }
 
     unsafe fn normalized_param_to_plain(&self, id: u32, value_normalized: f64) -> f64 {
+        if P::MIDI_INPUT >= MidiConfig::MidiCCs && id == VST3_PROGRAM_PARAM_ID {
+            return (value_normalized * (VST3_NUM_PROGRAMS - 1) as f64).round();
+        }
         match self.inner.param_by_hash.get(&id) {
             Some(param_ptr) => param_ptr.preview_plain(value_normalized as f32) as f64,
             _ => value_normalized,
@@ -652,6 +673,9 @@ impl<P: Vst3Plugin> IEditController for Wrapper<P> {
     }
 
     unsafe fn plain_param_to_normalized(&self, id: u32, plain_value: f64) -> f64 {
+        if P::MIDI_INPUT >= MidiConfig::MidiCCs && id == VST3_PROGRAM_PARAM_ID {
+            return plain_value / (VST3_NUM_PROGRAMS - 1) as f64;
+        }
         match self.inner.param_by_hash.get(&id) {
             Some(param_ptr) => param_ptr.preview_normalized(plain_value as f32) as f64,
             _ => plain_value,
@@ -659,6 +683,9 @@ impl<P: Vst3Plugin> IEditController for Wrapper<P> {
     }
 
     unsafe fn get_param_normalized(&self, id: u32) -> f64 {
+        if P::MIDI_INPUT >= MidiConfig::MidiCCs && id == VST3_PROGRAM_PARAM_ID {
+            return f32::from_bits(self.inner.program_value.load(Ordering::Relaxed)) as f64;
+        }
         match self.inner.param_by_hash.get(&id) {
             Some(param_ptr) => param_ptr.modulated_normalized_value() as f64,
             _ => 0.5,
@@ -666,6 +693,13 @@ impl<P: Vst3Plugin> IEditController for Wrapper<P> {
     }
 
     unsafe fn set_param_normalized(&self, id: u32, value: f64) -> tresult {
+        if P::MIDI_INPUT >= MidiConfig::MidiCCs && id == VST3_PROGRAM_PARAM_ID {
+            self.inner
+                .program_value
+                .store((value as f32).to_bits(), Ordering::Relaxed);
+            return kResultOk;
+        }
+
         // If the plugin is currently processing audio, then this parameter change will also be sent
         // to the process function
         if self.inner.is_processing.load(Ordering::SeqCst) {
@@ -1012,6 +1046,22 @@ impl<P: Vst3Plugin> IAudioProcessor for Wrapper<P> {
                                     total_buffer_len as u32,
                                 );
                                 let value = value as f32;
+
+                                if P::MIDI_INPUT >= MidiConfig::MidiCCs
+                                    && param_hash == VST3_PROGRAM_PARAM_ID
+                                {
+                                    self.inner
+                                        .program_value
+                                        .store(value.to_bits(), Ordering::Relaxed);
+                                    process_events.push(ProcessEvent::NoteEvent(
+                                        NoteEvent::MidiProgramChange {
+                                            timing,
+                                            channel: 0,
+                                            program: program_index(value),
+                                        },
+                                    ));
+                                    continue;
+                                }
 
                                 // MIDI CC messages, channel pressure, and pitch bend are also sent
                                 // as parameter changes
@@ -1808,7 +1858,12 @@ impl<P: Vst3Plugin> IUnitInfo for Wrapper<P> {
                 info.id = unit_id;
                 info.parent_unit_id = unit_info.parent_id;
                 u16strlcpy(&mut info.name, &unit_info.name);
-                info.program_list_id = kNoProgramListId;
+                info.program_list_id =
+                    if P::MIDI_INPUT >= MidiConfig::MidiCCs && unit_id == kRootUnitId {
+                        VST3_PROGRAM_LIST_ID
+                    } else {
+                        kNoProgramListId
+                    };
 
                 kResultOk
             }
@@ -1817,25 +1872,44 @@ impl<P: Vst3Plugin> IUnitInfo for Wrapper<P> {
     }
 
     unsafe fn get_program_list_count(&self) -> i32 {
-        // TODO: Do we want program lists? Probably not, CLAP doesn't even support them.
-        0
+        if P::MIDI_INPUT >= MidiConfig::MidiCCs {
+            1
+        } else {
+            0
+        }
     }
 
-    unsafe fn get_program_list_info(
-        &self,
-        _list_index: i32,
-        _info: *mut ProgramListInfo,
-    ) -> tresult {
-        kInvalidArgument
+    unsafe fn get_program_list_info(&self, list_index: i32, info: *mut ProgramListInfo) -> tresult {
+        check_null_ptr!(info);
+        if P::MIDI_INPUT < MidiConfig::MidiCCs || list_index != 0 {
+            return kInvalidArgument;
+        }
+
+        *info = mem::zeroed();
+        let info = &mut *info;
+        info.id = VST3_PROGRAM_LIST_ID;
+        u16strlcpy(
+            &mut *(&mut info.name as *mut [u16; 128] as *mut [TChar; 128]),
+            "Programs",
+        );
+        info.program_count = VST3_NUM_PROGRAMS as i32;
+
+        kResultOk
     }
 
-    unsafe fn get_program_name(
-        &self,
-        _list_id: i32,
-        _program_index: i32,
-        _name: *mut u16,
-    ) -> tresult {
-        kInvalidArgument
+    unsafe fn get_program_name(&self, list_id: i32, program_index: i32, name: *mut u16) -> tresult {
+        check_null_ptr!(name);
+        if P::MIDI_INPUT < MidiConfig::MidiCCs
+            || list_id != VST3_PROGRAM_LIST_ID
+            || !(0..VST3_NUM_PROGRAMS as i32).contains(&program_index)
+        {
+            return kInvalidArgument;
+        }
+
+        let dest = &mut *(name as *mut [TChar; 128]);
+        u16strlcpy(dest, &format!("Program {}", program_index + 1));
+
+        kResultOk
     }
 
     unsafe fn get_program_info(
@@ -1874,14 +1948,24 @@ impl<P: Vst3Plugin> IUnitInfo for Wrapper<P> {
 
     unsafe fn get_unit_by_bus(
         &self,
-        _type_: i32,
-        _dir: i32,
-        _bus_index: i32,
+        type_: i32,
+        dir: i32,
+        bus_index: i32,
         _channel: i32,
-        _unit_id: *mut i32,
+        unit_id: *mut i32,
     ) -> tresult {
-        // Stahp it!
-        kResultFalse
+        check_null_ptr!(unit_id);
+        // The program list lives on the root unit and listens on every channel of the MIDI input
+        if P::MIDI_INPUT >= MidiConfig::MidiCCs
+            && type_ == vst3_sys::vst::MediaTypes::kEvent as i32
+            && dir == vst3_sys::vst::BusDirections::kInput as i32
+            && bus_index == 0
+        {
+            *unit_id = kRootUnitId;
+            kResultOk
+        } else {
+            kResultFalse
+        }
     }
 
     unsafe fn set_unit_program_data(
@@ -1892,4 +1976,9 @@ impl<P: Vst3Plugin> IUnitInfo for Wrapper<P> {
     ) -> tresult {
         kInvalidArgument
     }
+}
+
+/// Program number for a normalized value of the program change parameter.
+fn program_index(normalized: f32) -> u8 {
+    (normalized.clamp(0.0, 1.0) * (VST3_NUM_PROGRAMS - 1) as f32).round() as u8
 }

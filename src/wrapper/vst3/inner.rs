@@ -81,6 +81,8 @@ pub(crate) struct WrapperInner<P: Vst3Plugin> {
     /// The current latency in samples, as set by the plugin through the [`InitContext`] and the
     /// [`ProcessContext`].
     pub current_latency: AtomicU32,
+    /// Normalized value of the program change parameter, as `f32` bits.
+    pub program_value: AtomicU32,
     /// A data structure that helps manage and create buffers for all of the plugin's inputs and
     /// outputs based on channel pointers provided by the host.
     pub buffer_manager: AtomicRefCell<BufferManager>,
@@ -303,6 +305,7 @@ impl<P: Vst3Plugin> WrapperInner<P> {
             current_process_mode: AtomicCell::new(ProcessMode::Realtime),
             last_process_status: AtomicCell::new(ProcessStatus::Normal),
             current_latency: AtomicU32::new(0),
+            program_value: AtomicU32::new(0),
             // This is initialized just before calling `Plugin::initialize()` so that during the
             // process call buffers can be initialized without any allocations
             buffer_manager: AtomicRefCell::new(BufferManager::for_audio_io_layout(

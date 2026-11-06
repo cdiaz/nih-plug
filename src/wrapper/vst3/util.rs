@@ -19,6 +19,13 @@ pub const VST3_MIDI_PARAMS_START: u32 = VST3_MIDI_PARAMS_END - VST3_MIDI_NUM_PAR
 /// The (exclusive) end of the MIDI CC parameter range. Anything above this is reserved by the host.
 pub const VST3_MIDI_PARAMS_END: u32 = 1 << 31;
 
+/// When `Plugin::MIDI_INPUT` is set to `MidiConfig::MidiCCs` or higher then we'll also register a
+/// program change parameter and a matching program list on the root unit. Hosts send MIDI program
+/// changes by setting this parameter, which is converted to a `NoteEvent::MidiProgramChange`.
+pub const VST3_PROGRAM_PARAM_ID: u32 = VST3_MIDI_PARAMS_START - 1;
+pub const VST3_PROGRAM_LIST_ID: i32 = 1;
+pub const VST3_NUM_PROGRAMS: u32 = 128;
+
 /// Early exit out of a VST3 function when one of the passed pointers is null
 macro_rules! check_null_ptr {
     ($ptr:expr $(, $ptrs:expr)* $(, )?) => {
