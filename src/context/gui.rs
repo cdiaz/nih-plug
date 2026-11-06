@@ -1,9 +1,39 @@
 //! A context passed to a plugin's editor.
 
+use std::cell::RefCell;
 use std::sync::Arc;
 
 use super::PluginApi;
 use crate::prelude::{Param, ParamPtr, Plugin, PluginState};
+
+thread_local! {
+    /// Set by the wrappers while a task scheduled with `execute_gui()` runs on the main thread.
+    static TASK_CONTEXT: RefCell<Option<Arc<dyn GuiContext>>> = const { RefCell::new(None) };
+}
+
+/// Runs `f` with a [`GuiContext`] for setting parameters from a task scheduled with
+/// `execute_gui()`, also while the editor is closed. Returns `None` when called anywhere else.
+pub fn with_task_context<R>(f: impl FnOnce(&dyn GuiContext) -> R) -> Option<R> {
+    let context = TASK_CONTEXT.with(|c| c.borrow().clone())?;
+    Some(f(context.as_ref()))
+}
+
+/// Makes `context` available to [`with_task_context()`] while `f` runs.
+pub(crate) fn run_with_task_context<R>(
+    context: Option<Arc<dyn GuiContext>>,
+    f: impl FnOnce() -> R,
+) -> R {
+    struct Restore(Option<Arc<dyn GuiContext>>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            let previous = self.0.take();
+            TASK_CONTEXT.with(|c| *c.borrow_mut() = previous);
+        }
+    }
+
+    let _restore = Restore(TASK_CONTEXT.with(|c| c.replace(context)));
+    f()
+}
 
 /// Callbacks the plugin can make when the user interacts with its GUI such as updating parameter
 /// values. This is passed to the plugin during [`Editor::spawn()`][crate::prelude::Editor::spawn()]. All of

@@ -4,7 +4,7 @@ use crossbeam::channel::{self, SendTimeoutError};
 use parking_lot::{Mutex, RwLock};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 use vst3_sys::base::{kInvalidArgument, kResultOk, tresult};
 use vst3_sys::vst::{IComponentHandler, RestartFlags};
@@ -14,6 +14,7 @@ use super::note_expressions::NoteExpressionController;
 use super::param_units::ParamUnits;
 use super::util::{ObjectPtr, VstPtr, VST3_MIDI_PARAMS_END, VST3_MIDI_PARAMS_START};
 use super::view::WrapperView;
+use crate::context::gui::{run_with_task_context, GuiContext};
 use crate::event_loop::{EventLoop, MainThreadExecutor, OsEventLoop};
 use crate::prelude::{
     AsyncExecutor, AudioIOLayout, BufferConfig, Editor, MidiConfig, ParamFlags, ParamPtr, Params,
@@ -28,6 +29,8 @@ use crate::wrapper::util::{hash_param_id, process_wrapper};
 /// Since we can't combine that with VST3's interior reference counting this just has to be moved to
 /// its own struct.
 pub(crate) struct WrapperInner<P: Vst3Plugin> {
+    /// A reference to this object, used to create a GUI context for main-thread plugin tasks.
+    this: AtomicRefCell<Weak<Self>>,
     /// The wrapped plugin instance.
     pub plugin: Mutex<P>,
     /// The plugin's background task executor closure.
@@ -275,6 +278,7 @@ impl<P: Vst3Plugin> WrapperInner<P> {
             .collect();
 
         let wrapper = Arc::new(Self {
+            this: AtomicRefCell::new(Weak::new()),
             plugin: Mutex::new(plugin),
             task_executor,
             params,
@@ -319,6 +323,8 @@ impl<P: Vst3Plugin> WrapperInner<P> {
             param_id_to_hash,
             param_ptr_to_hash,
         });
+
+        *wrapper.this.borrow_mut() = Arc::downgrade(&wrapper);
 
         // FIXME: Right now this is safe, but if we are going to have a singleton main thread queue
         //        serving multiple plugin instances, Arc can't be used because its reference count
@@ -609,7 +615,15 @@ impl<P: Vst3Plugin> MainThreadExecutor<Task<P>> for WrapperInner<P> {
     fn execute(&self, task: Task<P>, is_gui_thread: bool) {
         // This function is always called from the main thread
         match task {
-            Task::PluginTask(task) => (self.task_executor.lock())(task),
+            Task::PluginTask(task) => {
+                let context = if is_gui_thread {
+                    let this = self.this.borrow().upgrade();
+                    this.map(|this| this.make_gui_context() as Arc<dyn GuiContext>)
+                } else {
+                    None
+                };
+                run_with_task_context(context, || (self.task_executor.lock())(task))
+            }
             Task::ParameterValuesChanged => {
                 if self.plug_view.read().is_some() {
                     if let Some(editor) = self.editor.borrow().as_ref() {

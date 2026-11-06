@@ -7,12 +7,13 @@ use raw_window_handle::HasRawWindowHandle;
 use std::any::Any;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::thread;
 
 use super::backend::Backend;
 use super::config::WrapperConfig;
 use super::context::{WrapperGuiContext, WrapperInitContext, WrapperProcessContext};
+use crate::context::gui::{run_with_task_context, GuiContext};
 use crate::event_loop::{EventLoop, MainThreadExecutor, OsEventLoop};
 use crate::prelude::{
     AsyncExecutor, AudioIOLayout, BufferConfig, Editor, ParamFlags, ParamPtr, Params,
@@ -50,6 +51,8 @@ pub struct Wrapper<P: Plugin, B: Backend<P>> {
     /// GUI thread. See the same field in the VST3 wrapper for more information on why this looks
     /// the way it does.
     event_loop: AtomicRefCell<Option<OsEventLoop<Task<P>, Self>>>,
+    /// A reference to this object, used to create a GUI context for main-thread plugin tasks.
+    this: AtomicRefCell<Weak<Self>>,
 
     /// This is used to grab the DPI scaling config. Not used on macOS.
     #[allow(unused)]
@@ -152,9 +155,17 @@ impl WindowHandler for WrapperWindowHandler {
 }
 
 impl<P: Plugin, B: Backend<P>> MainThreadExecutor<Task<P>> for Wrapper<P, B> {
-    fn execute(&self, task: Task<P>, _is_gui_thread: bool) {
+    fn execute(&self, task: Task<P>, is_gui_thread: bool) {
         match task {
-            Task::PluginTask(task) => (self.task_executor.lock())(task),
+            Task::PluginTask(task) => {
+                let context = if is_gui_thread {
+                    let this = self.this.borrow().upgrade();
+                    this.map(|this| this.make_gui_context() as Arc<dyn GuiContext>)
+                } else {
+                    None
+                };
+                run_with_task_context(context, || (self.task_executor.lock())(task))
+            }
             Task::ParameterValuesChanged => {
                 if let Some(editor) = self.editor.borrow().as_ref() {
                     editor.lock().param_values_changed();
@@ -253,8 +264,10 @@ impl<P: Plugin, B: Backend<P>> Wrapper<P, B> {
             updated_state_sender,
             updated_state_receiver,
             current_latency: AtomicU32::new(0),
+            this: AtomicRefCell::new(Weak::new()),
         });
 
+        *wrapper.this.borrow_mut() = Arc::downgrade(&wrapper);
         *wrapper.event_loop.borrow_mut() =
             Some(OsEventLoop::new_and_spawn(Arc::downgrade(&wrapper)));
 

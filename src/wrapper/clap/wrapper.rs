@@ -80,6 +80,7 @@ use std::time::Duration;
 use super::context::{WrapperGuiContext, WrapperInitContext, WrapperProcessContext};
 use super::descriptor::PluginDescriptor;
 use super::util::ClapPtr;
+use crate::context::gui::{run_with_task_context, GuiContext};
 use crate::event_loop::{BackgroundThread, EventLoop, MainThreadExecutor, TASK_QUEUE_CAPACITY};
 use crate::midi::MidiResult;
 use crate::prelude::{
@@ -361,7 +362,15 @@ impl<P: ClapPlugin> MainThreadExecutor<Task<P>> for Wrapper<P> {
     fn execute(&self, task: Task<P>, is_gui_thread: bool) {
         // This function is always called from the main thread, from [Self::on_main_thread].
         match task {
-            Task::PluginTask(task) => (self.task_executor.lock())(task),
+            Task::PluginTask(task) => {
+                let context = if is_gui_thread {
+                    let this = self.this.borrow().upgrade();
+                    this.map(|this| this.make_gui_context() as Arc<dyn GuiContext>)
+                } else {
+                    None
+                };
+                run_with_task_context(context, || (self.task_executor.lock())(task))
+            }
             Task::ParameterValuesChanged => {
                 if self.editor_handle.lock().is_some() {
                     if let Some(editor) = self.editor.borrow().as_ref() {
